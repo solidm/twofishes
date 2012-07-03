@@ -20,3 +20,4 @@ mongo-testdb/*
 #*
 data/downloaded/*
 jrebel/*
+*.sublime-workspace
