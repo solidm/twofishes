@@ -19,4 +19,4 @@ mongo-testdb/*
 .#*
 #*
 data/downloaded/*
-javarebel/*
+jrebel/*
