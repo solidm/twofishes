@@ -19,5 +19,6 @@ mongo-testdb/*
 .#*
 #*
 data/downloaded/*
+data/private/*
 jrebel/*
 *.sublime-workspace
