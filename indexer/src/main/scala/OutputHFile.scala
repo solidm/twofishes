@@ -297,13 +297,16 @@ class OutputHFile(basepath: String, outputPrefixIndex: Boolean, slugEntryMap: Sl
 
   def logDuration[T](what: String)(f: => T): T = {
     val (rv, duration) = Duration.inNanoseconds(f)
-    println(what + " in %s µs / %s ms".format(duration.inMicroseconds, duration.inMilliseconds))
+    if (duration.inMilliseconds > 200) {
+      println(what + " in %s µs / %s ms".format(duration.inMicroseconds, duration.inMilliseconds))
+    }
     rv
   }
 
   def buildRevGeoIndex() { 
-    val minS2Level = 12
+    val minS2Level = 8
     val maxS2Level = 12
+    val maxCells = 1000
     val levelMod = 2
 
     val ids = MongoGeocodeDAO.primitiveProjections[ObjectId](MongoDBObject("hasPoly" -> true), "_id").toList
@@ -321,38 +324,33 @@ class OutputHFile(basepath: String, outputPrefixIndex: Boolean, slugEntryMap: Sl
             //println("reading poly %s".format(index))
             val geom = wkbReader.read(polygon)
 
-            var numCells = 0
-
-            for {
-              level <- minS2Level.to(maxS2Level)
-              if ((level - minS2Level) % levelMod) == 0
-            } {
-              logDuration("generating covering at level %s".format(level)) {
-                GeometryUtils.s2PolygonCovering(geom, level, level).foreach(
-                  (cellid: S2CellId) => {
-                    if (cellid.level() != level) {
-                      throw new Exception("generated wrong level: %d SHOULD NOT HAPPEN at %d".format(cellid.level, level))
-                    } else {
-                      val s2Bytes: Array[Byte] = GeometryUtils.getBytes(cellid)
-                      val bucket = s2map.getOrElseUpdate(ByteBuffer.wrap(s2Bytes), new HashSet[CellGeometry]())
-                      val cellGeometry = new CellGeometry()
-                      val (clippedGeom, isContained) = ShapefileS2Util.clipGeometryToCell(geom.buffer(0), cellid)
-                      if (isContained) {
-                        cellGeometry.setFull(true)
-                      } else {
-                        cellGeometry.setWkbGeometry(wkbWriter.write(clippedGeom))
-                      }
-                      cellGeometry.setWoeType(record.woeType)
-                      cellGeometry.setOid(record._id.toByteArray())
-                      bucket.add(cellGeometry)
-                      numCells += 1
-                    }
-                  } 
-                )
-              }
+            val cells = logDuration("generated cover ") {
+              GeometryUtils.s2PolygonCovering(
+                geom,
+                minS2Level,
+                maxS2Level,
+                levelMod = Some(levelMod),
+                maxCellsHintWhichMightBeIgnored = Some(1000)
+              )
             }
-
-            println("outputted %d cells".format(numCells))
+            logDuration("clipped and outputted cover for %d cells".format(cells.size)) {
+              cells.foreach(
+                (cellid: S2CellId) => {
+                  val s2Bytes: Array[Byte] = GeometryUtils.getBytes(cellid)
+                  val bucket = s2map.getOrElseUpdate(ByteBuffer.wrap(s2Bytes), new HashSet[CellGeometry]())
+                  val cellGeometry = new CellGeometry()
+                  val (clippedGeom, isContained) = ShapefileS2Util.clipGeometryToCell(geom.buffer(0), cellid)
+                  if (isContained) {
+                    cellGeometry.setFull(true)
+                  } else {
+                    cellGeometry.setWkbGeometry(wkbWriter.write(clippedGeom))
+                  }
+                  cellGeometry.setWoeType(record.woeType)
+                  cellGeometry.setOid(record._id.toByteArray())
+                  bucket.add(cellGeometry)
+                } 
+              )
+            }
           }
         }
 
@@ -459,12 +457,15 @@ class OutputHFile(basepath: String, outputPrefixIndex: Boolean, slugEntryMap: Sl
     fs.initialize(URI.create("file:///"), conf)
     val hadoopConfiguration: Configuration = new Configuration()
 
-    val writer = new HFile.Writer(
-      fs,
-      path,
-      blockSize,
-      compressionAlgo,
-      null /* Will cause the right comparator to be chosen */)
+    val compressionAlgorithm: Compression.Algorithm =
+      Compression.getCompressionAlgorithmByName("none")
+
+    val blockSizeBytes = 1024 * 1024
+
+    val writer = HFile.getWriterFactory(hadoopConfiguration).createWriter(fs,
+      path,  
+      blockSizeBytes, compressionAlgorithm,
+      null)
     writer.appendFileInfo(HFileUtil.ThriftEncodingKeyBytes, thriftProtocol.getClass.getName.getBytes("UTF-8"))
     writer
   }

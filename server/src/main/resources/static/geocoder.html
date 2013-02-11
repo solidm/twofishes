@@ -62,6 +62,17 @@
     var searchButton = $('#search');
     var searchForm = $('#searchForm');
     var debugInfo = $('#debugInfo');
+
+    function getQuery() {
+      query = window.location.hash.substr(1);
+
+      if (query == "") {
+        query = window.location.search.substr(1);
+      }
+
+      return query
+    }
+
     lookupButton.click(function() {
       window.location.hash = "slug=" + lookupInput.val();
       geocode();
@@ -81,7 +92,7 @@
     })
     
     function geocode() {
-      var query = location.hash.substr(1);
+      var query = getQuery()
 
       if (query.match(/.*=.*/)) {
         $.getJSON('http://' + window.location.host + '/?debug=1&responseIncludes=EVERYTHING&' + query,
@@ -159,7 +170,21 @@
           if (feature.geometry.wktGeometry) {
             var wkt = new Wkt.Wkt();
             wkt.read(feature.geometry.wktGeometry);
-            map.addLayer(wkt.toObject());
+            map.addLayer(wkt.toObject({color: 'blue'}));
+          }
+
+          if (data.requestWktGeometry) {
+
+            var myIcon = L.icon({
+              iconUrl: '/static/leaflet/images/red.png',
+            });
+
+            var wkt = new Wkt.Wkt();
+            wkt.read(data.requestWktGeometry)
+            map.addLayer(wkt.toObject({
+              color: '#03f',
+              fillColor: '#03f',
+              icon: myIcon}));
           }
         }
       });

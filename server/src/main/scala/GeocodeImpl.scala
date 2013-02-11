@@ -5,7 +5,8 @@ import com.foursquare.twofishes.Implicits._
 import com.foursquare.twofishes.util.{GeoTools, GeometryUtils, NameNormalizer, NameUtils, TwofishesLogger}
 import com.foursquare.twofishes.util.Lists.Implicits._
 import com.foursquare.twofishes.util.NameUtils.BestNameMatch
-import com.twitter.util.{Duration}
+import com.twitter.ostrich.stats.Stats
+import com.twitter.util.Duration
 import com.vividsolutions.jts.geom.{Coordinate, Geometry, GeometryFactory}
 import com.vividsolutions.jts.io.{WKBReader, WKTWriter}
 import com.vividsolutions.jts.util.GeometricShapeFactory
@@ -17,9 +18,7 @@ import scala.collection.mutable.{HashMap, ListBuffer}
 import scalaj.collection.Implicits._
 
 // TODO
-// cover %age
-// adminid lookup
-// deprecated slug output
+// 
 
 // TODO
 // --make autocomplete faster
@@ -966,6 +965,7 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
   }
 
   def geocode(): GeocodeResponse = {
+    Stats.incr("geocode-requests", 1)
     val query = req.query
     if (query != null) {
       logger.ifDebug("%s --> %s".format(query, NameNormalizer.normalize(query)))
@@ -1161,11 +1161,17 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
     }
 
     if (Option(req.slug).exists(_.nonEmpty)) {
-      doSlugGeocode(req.slug)
+      Stats.time("slug-geocode") {
+        doSlugGeocode(req.slug)
+      }
     } else if (req.autocomplete) {
-      doAutocompleteGeocode(spaceAtEnd, parseParams)
+      Stats.time("autocomplete-geocode") {
+        doAutocompleteGeocode(spaceAtEnd, parseParams)
+      }
     } else {
-      doNormalGeocode(parseParams)
+      Stats.time("geocode") {
+        doNormalGeocode(parseParams)
+      }
     }
   }
 
@@ -1191,8 +1197,9 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
     }
   }
 
-  def logDuration[T](what: String)(f: => T): T = {
+  def logDuration[T](ostrichKey: String, what: String)(f: => T): T = {
     val (rv, duration) = Duration.inNanoseconds(f)
+    Stats.addMetric(ostrichKey, duration.inMicroseconds.toInt)
     if (req.debug > 0) {
       logger.ifDebug(what + " in %s µs / %s ms".format(duration.inMicroseconds, duration.inMilliseconds))
     }
@@ -1249,7 +1256,7 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
         if (cellGeometry.isFull) {
           Some(oid)
         } else {
-          val (geom, intersects) = logDuration("intersecting %s".format(oid)) {
+          val (geom, intersects) = logDuration("insersection_check", "intersecting %s".format(oid)) {
             featureGeometryIntersections(cellGeometry.getWkbGeometry(), otherGeom)
           }
           if (intersects) {
@@ -1289,12 +1296,29 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
     }
 
     val sortedParses = parses.sorted(new ReverseGeocodeParseOrdering).take(maxInterpretations)
-    hydrateParses(0, sortedParses, parseParams, polygonMap)
+    val response = hydrateParses(0, sortedParses, parseParams, polygonMap)
+    if (req.debug > 0) {
+      val wktWriter = new WKTWriter
+      response.setRequestWktGeometry(wktWriter.write(otherGeom))
+    }
+    response
+  }
+
+  def getAllLevels(): Seq[Int] = {
+    for {
+      level <- store.getMinS2Level.to(store.getMaxS2Level)
+      if ((level - store.getMinS2Level) % store.getLevelMod) == 0
+    } yield { level }
   }
 
   def reverseGeocodePoint(ll: GeocodePoint): GeocodeResponse = {
-    logger.ifDebug("doing point revgeo on %s at level %s".format(ll, store.getMaxS2Level))
-    val cellids: Seq[Long] = List(GeometryUtils.getS2CellIdForLevel(ll.lat, ll.lng, store.getMaxS2Level).id())
+    val levels = getAllLevels()
+    logger.ifDebug("doing point revgeo on %s at levels %s".format(ll, levels.mkString(",")))
+
+    val cellids: Seq[Long] = 
+      levels.map(level =>
+        GeometryUtils.getS2CellIdForLevel(ll.lat, ll.lng, level).id()
+      )
     logger.ifDebug("looking up: " + cellids.mkString(" "))
 
     val geomFactory = new GeometryFactory()
@@ -1305,7 +1329,20 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
     doReverseGeocode(cellids, point)
   }
 
+  def doGeometryReverseGeocode(geom: Geometry) = {
+    val cellids = logDuration("s2_cover_time", "s2_cover_time") {
+      GeometryUtils.coverAtAllLevels(
+        geom,
+        store.getMinS2Level,
+        store.getMaxS2Level,
+        Some(store.getLevelMod)
+      ).map(_.id())
+    }
+    doReverseGeocode(cellids, geom)
+  }
+
   def reverseGeocode(): GeocodeResponse = {
+    Stats.incr("revgeo-requests", 1)
     if (req.ll != null) {
       if (req.isSetRadius) {
         val sizeDegrees = req.radius / 111319.9
@@ -1314,15 +1351,13 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
         gsf.setNumPoints(100)
         gsf.setCentre(new Coordinate(req.ll.lng, req.ll.lat))
         val geom = gsf.createCircle()
-        val cellids = GeometryUtils.s2PolygonCovering(
-          geom,
-          store.getMinS2Level,
-          store.getMaxS2Level,
-          Some(store.getLevelMod)
-        ).map(_.id())
-        doReverseGeocode(cellids, geom)
+        Stats.time("revgeo-geom") {
+          doGeometryReverseGeocode(geom)
+        }
       } else {
-        reverseGeocodePoint(req.ll)
+        Stats.time("revgeo-point") {
+          reverseGeocodePoint(req.ll)
+        }
       }
     } else if (req.bounds != null) {
       val s2rect = GeoTools.boundingBoxToS2Rect(req.bounds)
@@ -1334,9 +1369,9 @@ class GeocoderImpl(store: GeocodeStorageReadService, req: GeocodeRequest) extend
         new Coordinate(s2rect.lng.hi, s2rect.lat.lo),
         new Coordinate(s2rect.lng.lo, s2rect.lat.lo)
       ))
-      val cellids = GeometryUtils.rectCover(s2rect, store.getMinS2Level, store.getMaxS2Level,
-        Some(store.getLevelMod)).map(_.id())
-      doReverseGeocode(cellids, geom)
+      Stats.time("revgeo-geom") {
+        doGeometryReverseGeocode(geom)
+      }
     } else {
       throw new Exception("no bounds or ll")
     }
