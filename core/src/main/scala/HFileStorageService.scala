@@ -17,32 +17,15 @@ import scala.collection.JavaConversions._
 import scalaj.collection.Implicits._
 
 class HFileStorageService(basepath: String, shouldPreload: Boolean) extends GeocodeStorageReadService {
-  val slugFidMapFuture = FuturePool.defaultPool {
-    val (rv, duration) = Duration.inMilliseconds(readSlugMap())
-    println("took %s seconds to read id map".format(duration.inSeconds))
-    rv
-  }
-
   val nameMap = new NameIndexHFileInput(basepath, shouldPreload)
   val oidMap = new GeocodeRecordHFileInput(basepath, shouldPreload)
   val geomMap = new GeometryHFileInput(basepath, shouldPreload)
   val s2mapOpt = ReverseGeocodeHFileInput.readInput(basepath, shouldPreload)
+  val slugFidMap = new SlugFidHFileInput(basepath, shouldPreload)
+
   // will only be hit if we get a reverse geocode query
   lazy val s2map = s2mapOpt.getOrElse(
     throw new Exception("s2/revgeo index not built, please build s2_index.hfile"))
-
-  lazy val slugFidMap = slugFidMapFuture.get()
-
-  if (shouldPreload) {
-    slugFidMap.get()
-  }
-
-  def readSlugMap() = {
-    scala.io.Source.fromFile(new File(basepath, "id-mapping.txt")).getLines.map(l => {
-      val parts = l.split("\t")
-      (parts(0), parts(1))
-    }).toMap
-  }
 
   def getIdsByNamePrefix(name: String): Seq[ObjectId] = {
     nameMap.getPrefix(name)
@@ -53,30 +36,18 @@ class HFileStorageService(basepath: String, shouldPreload: Boolean) extends Geoc
   }
 
   def getByName(name: String): Seq[GeocodeServingFeature] = {
-    nameMap.get(name).flatMap(oid => {
-      oidMap.get(oid)
-    })
+    getByObjectIds(nameMap.get(name)).map(_._2).toSeq
   }
 
   def getByObjectIds(oids: Seq[ObjectId]): Map[ObjectId, GeocodeServingFeature] = {
-    oids.flatMap(oid => oidMap.get(oid).map(r => (oid -> r))).toMap
+    oidMap.getByObjectIds(oids)
   }
-
+ 
   def getBySlugOrFeatureIds(ids: Seq[String]) = {
-    val oidMap = ids.flatMap(id => slugFidMap.get(id).flatMap(oid => {
-      // temporary hack because we're outputting a map of 
-      // slug -> geoid
-      // geoid -> oid
-
-      if (ObjectId.isValid(oid)) {
-        Some((new ObjectId(oid), id))
-      } else {
-        for {
-          oid2 <- slugFidMap.get(oid)
-          if ObjectId.isValid(oid2)
-        } yield { (new ObjectId(oid2), id) } 
-      }
-    })).toMap
+    val oidMap = (for {
+      id <- ids
+      oid <- slugFidMap.get(id)
+    } yield { (oid, id) }).toMap
 
     getByObjectIds(oidMap.keys.toList).map({
       case (k, v) => (oidMap(k), v)
@@ -266,13 +237,46 @@ class GeometryHFileInput(basepath: String, shouldPreload: Boolean)
   }
 }
 
+class SlugFidHFileInput(basepath: String, shouldPreload: Boolean)
+    extends HFileInput(basepath, "id-mapping.hfile", shouldPreload) with ObjectIdReader { 
+  def get(s: String): Option[ObjectId] = {
+    val buf = ByteBuffer.wrap(s.getBytes("UTF-8"))
+    lookup(buf).flatMap(b => {
+      val bytes = TBaseHelper.byteBufferToByteArray(b)
+      decodeObjectIds(bytes).headOption
+    })
+  }
+}
+
 class GeocodeRecordHFileInput(basepath: String, shouldPreload: Boolean)
     extends HFileInput(basepath, "features.hfile", shouldPreload) with ObjectIdReader { 
+
+  def decodeFeature(b: ByteBuffer) = {
+    val bytes = TBaseHelper.byteBufferToByteArray(b)
+    deserializeBytes(new GeocodeServingFeature(), bytes)
+  }
+
+  def getByObjectIds(oids: Seq[ObjectId]): Map[ObjectId, GeocodeServingFeature] = {
+    val comp = new ByteArrayComparator()
+    val sortedOids = oids.map(oid => (oid.toByteArray(), oid)).toList.sortWith((a, b) => {
+      comp.compare(a._1, b._1) < 0
+    })
+
+    val scanner: HFileScanner = reader.getScanner(true, true)
+    def find(b: Array[Byte]) = {
+      val key = ByteBuffer.wrap(b)
+      if (scanner.seekTo(key.array, key.position, key.remaining) == 0) {
+        Some(scanner.getValue.duplicate())
+      } else {
+        None
+      }
+    }
+
+    sortedOids.flatMap({case (oidBytes, oid) => find(oidBytes).map(f => (oid, decodeFeature(f)))}).toMap
+  }
+
   def get(oid: ObjectId): Option[GeocodeServingFeature] = {
     val buf = ByteBuffer.wrap(oid.toByteArray())
-    lookup(buf).map(b => {
-      val bytes = TBaseHelper.byteBufferToByteArray(b)
-      deserializeBytes(new GeocodeServingFeature(), bytes)
-    })
+    lookup(buf).map(decodeFeature)
   }
 }
