@@ -1,13 +1,13 @@
  //  Copyright 2012 Foursquare Labs Inc. All Rights Reserved
 package com.foursquare.twofishes
 
-import com.foursquare.twofishes.util.Helpers
 import collection.JavaConverters._
+import com.foursquare.twofishes.util.Helpers
 import com.twitter.finagle.{Service, SimpleFilter}
 import com.twitter.finagle.builder.{Server, ServerBuilder}
 import com.twitter.finagle.http.Http
+import com.twitter.ostrich.stats.{Stats, StatsProvider}
 import com.twitter.finagle.thrift.ThriftServerFramedCodec
-import com.twitter.finagle.stats.OstrichStatsReceiver
 import com.twitter.util.{Future, FuturePool}
 import java.io.InputStream
 import java.net.InetSocketAddress
@@ -22,12 +22,14 @@ import org.jboss.netty.util.CharsetUtil
 import scala.collection.mutable.ListBuffer
 
 class GeocodeServerImpl(store: GeocodeStorageReadService) extends Geocoder.ServiceIface {
-  def geocode(r: GeocodeRequest): Future[GeocodeResponse] = {
-    Future.value(new GeocoderImpl(store, r).geocode())
+  val queryFuturePool = FuturePool(StatsWrappedExecutors.create(24, 100, "geocoder"))
+
+  def geocode(r: GeocodeRequest): Future[GeocodeResponse] = queryFuturePool {
+    new GeocoderImpl(store, r).geocode()
   }
 
-  def reverseGeocode(r: GeocodeRequest): Future[GeocodeResponse] = {
-    Future.value(new GeocoderImpl(store, r).reverseGeocode())
+  def reverseGeocode(r: GeocodeRequest): Future[GeocodeResponse] = queryFuturePool {
+    new GeocoderImpl(store, r).reverseGeocode()
   }
 }
 
@@ -173,10 +175,12 @@ object ServerStore {
 object GeocodeThriftServer extends Application {
   class GeocodeServer(store: GeocodeStorageReadService) extends Geocoder.Iface {
     override def geocode(request: GeocodeRequest): GeocodeResponse = {
+      Stats.incr("geocode-requests", 1)
       new GeocoderImpl(store, request).geocode()
     }
 
     override def reverseGeocode(request: GeocodeRequest): GeocodeResponse = {
+      Stats.incr("geocode-requests", 1)
       new GeocoderImpl(store, request).reverseGeocode()
     }
   }
@@ -219,7 +223,7 @@ object GeocodeFinagleServer {
     val server: Server = ServerBuilder()
       .bindTo(new InetSocketAddress(config.thriftServerPort))
       .codec(ThriftServerFramedCodec())
-      .reportTo(new OstrichStatsReceiver)
+      .reportTo(new FoursquareStatsReceiver)
       .name("geocoder")
       .build(service)
 
@@ -228,7 +232,7 @@ object GeocodeFinagleServer {
         .bindTo(new InetSocketAddress(config.thriftServerPort + 1))
         .codec(Http())
         .name("geocoder-http")
-        .reportTo(new OstrichStatsReceiver)
+        .reportTo(new FoursquareStatsReceiver)
         .build(handleExceptions andThen new GeocoderHttpService(processor))
     }
   }
