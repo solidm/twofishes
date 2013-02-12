@@ -46,6 +46,7 @@ else:
   cmd_opts += ' --output_prefix_index false'
   
 cmd = './sbt "indexer/run-main com.foursquare.twofishes.importers.geonames.GeonamesParser %s --hfile_basepath %s"' % (cmd_opts, basepath)
+#cmd = 'java -Xmx6G -Xms2G -cp indexer/target/indexer-assembly-0.72.jar com.foursquare.twofishes.importers.geonames.GeonamesParser %s --hfile_basepath %s' % (cmd_opts, basepath)
 print(cmd)
 
 if not options.dry_run:
